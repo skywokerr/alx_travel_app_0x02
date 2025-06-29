@@ -1,55 +1,128 @@
-from rest_framework import viewsets, permissions
-from .models import Listing, Booking
-from .serializers import ListingSerializer, BookingSerializer
-from drf_yasg.utils import swagger_auto_schema
-from drf_yasg import openapi
+import requests
+import json
+from django.conf import settings
+from django.http import JsonResponse
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from .models import Booking, Payment
+from .serializers import PaymentSerializer
 
-class ListingViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows listings to be viewed or edited.
-    """
-    queryset = Listing.objects.all().order_by('-created_at')
-    serializer_class = ListingSerializer
-    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+class InitiatePaymentView(APIView):
+    def post(self, request, booking_id):
+        try:
+            booking = Booking.objects.get(id=booking_id, user=request.user)
+            
+            # Check if payment already exists
+            if hasattr(booking, 'payment'):
+                return Response(
+                    {'error': 'Payment already initiated for this booking'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
-    @swagger_auto_schema(
-        operation_description="Retrieve a list of all listings",
-        responses={200: ListingSerializer(many=True)}
-    )
-    def list(self, request, *args, **kwargs):
-        return super().list(request, *args, **kwargs)
+            # Prepare Chapa payment data
+            chapa_url = "https://api.chapa.co/v1/transaction/initialize"
+            headers = {
+                "Authorization": f"Bearer {settings.CHAPA_SECRET_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "amount": str(booking.total_price),
+                "currency": "ETB",
+                "email": request.user.email,
+                "first_name": request.user.first_name,
+                "last_name": request.user.last_name,
+                "tx_ref": f"booking_{booking.id}",
+                "callback_url": f"{settings.BASE_URL}/api/payments/verify/{booking.id}/",
+                "return_url": f"{settings.FRONTEND_URL}/bookings/{booking.id}/payment-complete/",
+                "customization": {
+                    "title": "ALX Travel App",
+                    "description": "Booking Payment"
+                }
+            }
 
-    @swagger_auto_schema(
-        operation_description="Create a new listing",
-        request_body=ListingSerializer,
-        responses={201: ListingSerializer()}
-    )
-    def create(self, request, *args, **kwargs):
-        return super().create(request, *args, **kwargs)
+            # Make request to Chapa API
+            response = requests.post(chapa_url, headers=headers, data=json.dumps(payload))
+            response_data = response.json()
 
+            if response.status_code == 200 and response_data['status'] == 'success':
+                # Create payment record
+                payment = Payment.objects.create(
+                    booking=booking,
+                    amount=booking.total_price,
+                    transaction_id=response_data['data']['tx_ref'],
+                    chapa_response=response_data
+                )
 
-class BookingViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows bookings to be viewed or edited.
-    """
-    querizer_class = BookingSerializer
-    permission_classes = [permissions.IsAuthenticated]
+                return Response({
+                    'payment_url': response_data['data']['checkout_url'],
+                    'payment_id': payment.id,
+                    'status': 'Payment initiated successfully'
+                }, status=status.HTTP_201_CREATED)
+            else:
+                return Response(
+                    {'error': 'Failed to initiate payment', 'details': response_data},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
-    def get_queryset(self):
-        # Users can only see their own bookings
-        return Booking.objects.filter(user=self.request.user).order_by('-start_date')
+        except Booking.DoesNotExist:
+            return Response(
+                {'error': 'Booking not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
-    @swagger_auto_schema(
-        operation_description="Retrieve a list of user's bookings",
-        responses={200: BookingSerializer(many=True)}
-    )
-    def list(self, request, *args, **kwargs):
-        return super().list(request, *args, **kwargs)
+class VerifyPaymentView(APIView):
+    def get(self, request, booking_id):
+        try:
+            booking = Booking.objects.get(id=booking_id)
+            payment = Payment.objects.get(booking=booking)
+            
+            # Verify payment with Chapa
+            verify_url = f"https://api.chapa.co/v1/transaction/verify/{payment.transaction_id}"
+            headers = {
+                "Authorization": f"Bearer {settings.CHAPA_SECRET_KEY}"
+            }
+            
+            response = requests.get(verify_url, headers=headers)
+            response_data = response.json()
 
-    @swagger_auto_schema(
-        operation_description="Create a new booking",
-        request_body=BookingSerializer,
-        responses={201: BookingSerializer()}
-    )
-    def create(self, request, *args, **kwargs):
-        return super().create(request, *args, **kwargs)
+            if response.status_code == 200:
+                # Update payment status
+                if response_data['status'] == 'success':
+                    payment.status = 'completed'
+                else:
+                    payment.status = 'failed'
+                
+                payment.chapa_response = response_data
+                payment.save()
+
+                # Send confirmation email if payment successful
+                if payment.status == 'completed':
+                    from .tasks import send_payment_confirmation_email
+                    send_payment_confirmation_email.delay(booking.id)
+
+                return Response(
+                    PaymentSerializer(payment).data,
+                    status=status.HTTP_200_OK
+                )
+            else:
+                return Response(
+                    {'error': 'Payment verification failed', 'details': response_data},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        except (Booking.DoesNotExist, Payment.DoesNotExist):
+            return Response(
+                {'error': 'Booking or payment not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
